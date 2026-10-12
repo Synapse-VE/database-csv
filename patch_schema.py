@@ -24,6 +24,10 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -43,6 +47,7 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -52,6 +57,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
