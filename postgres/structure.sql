@@ -1025,6 +1025,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-us1";
 \connect empire-ranking-us1;
 --
@@ -1805,6 +1890,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-cz1";
 \connect empire-ranking-cz1;
@@ -2587,6 +2757,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-ro1";
 \connect empire-ranking-ro1;
 --
@@ -3367,6 +3622,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-nl1";
 \connect empire-ranking-nl1;
@@ -4149,6 +4489,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-world1";
 \connect empire-ranking-world1;
 --
@@ -4929,6 +5354,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-int3";
 \connect empire-ranking-int3;
@@ -5711,6 +6221,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-de1";
 \connect empire-ranking-de1;
 --
@@ -6491,6 +7086,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-tr1";
 \connect empire-ranking-tr1;
@@ -7284,6 +7964,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-pt1";
 \connect empire-ranking-pt1;
 --
@@ -8075,6 +8840,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-br1";
 \connect empire-ranking-br1;
@@ -8868,6 +9718,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-in1";
 \connect empire-ranking-in1;
 --
@@ -9659,6 +10594,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-it1";
 \connect empire-ranking-it1;
@@ -10452,6 +11472,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-pl1";
 \connect empire-ranking-pl1;
 --
@@ -11244,6 +12349,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-au1";
 \connect empire-ranking-au1;
 --
@@ -12024,6 +13214,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-ar1";
 \connect empire-ranking-ar1;
@@ -12806,6 +14081,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-hant1";
 \connect empire-ranking-hant1;
 --
@@ -13586,6 +14946,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-hu1";
 \connect empire-ranking-hu1;
@@ -14368,6 +15813,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-hu2";
 \connect empire-ranking-hu2;
 --
@@ -15148,6 +16678,91 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
 CREATE DATABASE "empire-ranking-global";
 \connect empire-ranking-global;
@@ -16057,6 +17672,91 @@ CREATE UNIQUE INDEX global_ranking_unique_idx ON public.global_ranking USING btr
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-es1";
 \connect empire-ranking-es1;
 --
@@ -16838,6 +18538,91 @@ ALTER TABLE ONLY public.server_statistics
 
 
 
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
 CREATE DATABASE "empire-ranking-sa1";
 \connect empire-ranking-sa1;
 --
@@ -17618,4 +19403,89 @@ ALTER TABLE ONLY public.server_statistics
 --
 
 
+
+
+--
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- Adds the columns and tables the backend/scraper code expects but the
+-- public database-csv does not ship. Idempotent so re-running the
+-- migration is safe.
+--
+
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_searching_alliance boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS auto_join_enabled boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS is_island_king boolean DEFAULT false;
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS language varchar(10);
+ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
+
+CREATE TABLE IF NOT EXISTS public.alliance_description_history (
+  id serial PRIMARY KEY,
+  alliance_id integer NOT NULL REFERENCES public.alliances(id),
+  old_description text,
+  new_description text,
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_description_history_alliance_id
+  ON public.alliance_description_history(alliance_id);
+
+CREATE TABLE IF NOT EXISTS public.dungeons_history (
+  id serial PRIMARY KEY,
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL REFERENCES public.players(id),
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+
+CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
+  kid smallint NOT NULL,
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  player_id integer NOT NULL,
+  available_at timestamptz NOT NULL,
+  PRIMARY KEY (kid, position_x, position_y, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.storm_meta (
+  id boolean PRIMARY KEY DEFAULT TRUE,
+  season_started_at timestamptz,
+  season_checked_at timestamptz,
+  scan_radius smallint,
+  last_scan_at timestamptz,
+  own_isle_object_id integer,
+  own_isle_x smallint,
+  own_isle_y smallint,
+  CONSTRAINT storm_meta_single_row CHECK (id = TRUE)
+);
+INSERT INTO public.storm_meta (id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.storm_forts (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  isle_id smallint NOT NULL,
+  victory_count smallint NOT NULL DEFAULT 0,
+  is_visible boolean NOT NULL DEFAULT TRUE,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_available_at ON public.storm_forts(available_at);
+CREATE INDEX IF NOT EXISTS idx_storm_forts_isle_id ON public.storm_forts(isle_id);
+
+CREATE TABLE IF NOT EXISTS public.storm_isles (
+  position_x smallint NOT NULL,
+  position_y smallint NOT NULL,
+  object_id integer NOT NULL,
+  isle_id smallint NOT NULL,
+  occupier_id integer,
+  state smallint NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT NOW(),
+  updated_at timestamptz NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (position_x, position_y)
+);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
+CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
