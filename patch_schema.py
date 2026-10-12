@@ -27,6 +27,7 @@ ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
 ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
 ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
@@ -44,8 +45,10 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
