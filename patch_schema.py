@@ -166,26 +166,43 @@ CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.be
 
 --
 -- ==== Grand Tournament ====
--- Used by the /grand-tournament endpoints in the backend.
--- The materialized view is what the API reads; the base table is written
--- by the scraper when the event is live. The view is refreshed on demand.
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
 --
 
-CREATE TABLE IF NOT EXISTS public.grand_tournament_hours (
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
   id BIGSERIAL PRIMARY KEY,
-  event_id INTEGER NOT NULL,
-  hour TIMESTAMPTZ NOT NULL,
-  game VARCHAR(20),
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_grand_tournament_hours_event
-  ON public.grand_tournament_hours(event_id, hour);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
-SELECT event_id, hour, game
-FROM public.grand_tournament_hours
-GROUP BY event_id, hour, game
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
 ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
 
 --
 -- ==== Global ranking (materialized view) ====
