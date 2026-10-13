@@ -24,6 +24,12 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
 ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
 ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
 ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
