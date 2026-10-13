@@ -10,7 +10,7 @@ from pathlib import Path
 
 POSTGRES_PATCH = r"""
 --
--- ==== gge-tracker-his1 fork: schema drift fixes ====
+-- ==== gge-tracker fork: schema drift fixes ====
 -- Adds the columns and tables the backend/scraper code expects but the
 -- public database-csv does not ship. Idempotent so re-running the
 -- migration is safe.
@@ -187,10 +187,30 @@ FROM public.grand_tournament_hours
 GROUP BY event_id, hour, game
 ORDER BY event_id, hour;
 
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
 """
 
 CLICKHOUSE_PER_DB_PATCH = r"""
--- gge-tracker-his1 fork: player_metrics table (bug in upstream)
+-- gge-tracker fork: player_metrics table (bug in upstream)
 CREATE TABLE IF NOT EXISTS {db}.player_metrics (
   player_id UInt32,
   metric_id UInt16,
@@ -201,7 +221,7 @@ PARTITION BY toYYYYMM(collected_at)
 ORDER BY (player_id, metric_id, collected_at)
 SETTINGS index_granularity = 8192;
 
--- gge-tracker-his1 fork: Wheel of Unimaginable Affluence (LT=72)
+-- Wheel of Unimaginable Affluence (LT=72)
 -- Written by fetch-and-save-wheel-affluence.ts (insertWheelOfUnimaginableAffluenceData)
 CREATE TABLE IF NOT EXISTS {db}.wheel_unimaginable_affluence (
   player_id UInt32,
@@ -212,7 +232,7 @@ PARTITION BY toYYYYMM(created_at)
 ORDER BY (player_id, created_at)
 SETTINGS index_granularity = 8192;
 
--- gge-tracker-his1 fork: Outer Realms live ranking (token-scrapper)
+-- Outer Realms live ranking (token-scrapper)
 -- Written by storeOuterRealmsEntries in the internal-scraping package.
 -- Distinct from the Postgres outer_realms_ranking, which keeps event history.
 CREATE TABLE IF NOT EXISTS {db}.outer_realms_ranking (
@@ -232,7 +252,7 @@ PARTITION BY toYYYYMM(fetch_date)
 ORDER BY (fetch_date, rank)
 SETTINGS index_granularity = 8192;
 
--- gge-tracker-his1 fork: marker table for the last Outer Realms sweep
+-- Marker table for the last Outer Realms sweep
 CREATE TABLE IF NOT EXISTS {db}.latest_fetch_date (
   fetch_date DateTime
 ) ENGINE = MergeTree
@@ -242,9 +262,9 @@ SETTINGS index_granularity = 8192;
 """
 
 CLICKHOUSE_GLOBAL_DB = r"""
--- gge-tracker-his1 fork: shared global database (cross-server boards)
+-- Shared global database (cross-server boards).
 -- Read by the backend for /events (live Outer Realms), /rift-raid, and the
--- global ranking endpoints. For a single-server fork these are all HIS1.
+-- global ranking endpoints. A single-server fork writes its own data here.
 CREATE DATABASE IF NOT EXISTS ggetracker_global;
 
 CREATE TABLE IF NOT EXISTS ggetracker_global.outer_realms_ranking (
@@ -294,7 +314,7 @@ SETTINGS index_granularity = 8192;
 """
 
 CLICKHOUSE_LOGS_DB = r"""
--- gge-tracker-his1 fork: shared logs database (audit + scrapes)
+-- Shared logs database (audit + scrapes)
 CREATE DATABASE IF NOT EXISTS logs;
 
 CREATE TABLE IF NOT EXISTS logs.scrapes (
