@@ -158,6 +158,29 @@ CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
 CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
 CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
 
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend.
+-- The materialized view is what the API reads; the base table is written
+-- by the scraper when the event is live. The view is refreshed on demand.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament_hours (
+  id BIGSERIAL PRIMARY KEY,
+  event_id INTEGER NOT NULL,
+  hour TIMESTAMPTZ NOT NULL,
+  game VARCHAR(20),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_hours_event
+  ON public.grand_tournament_hours(event_id, hour);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT event_id, hour, game
+FROM public.grand_tournament_hours
+GROUP BY event_id, hour, game
+ORDER BY event_id, hour;
+
 """
 
 CLICKHOUSE_PER_DB_PATCH = r"""
