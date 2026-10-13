@@ -103,6 +103,61 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
 
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
 """
 
 CLICKHOUSE_PER_DB_PATCH = r"""
@@ -115,6 +170,96 @@ CREATE TABLE IF NOT EXISTS {db}.player_metrics (
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(collected_at)
 ORDER BY (player_id, metric_id, collected_at)
+SETTINGS index_granularity = 8192;
+
+-- gge-tracker-his1 fork: Wheel of Unimaginable Affluence (LT=72)
+-- Written by fetch-and-save-wheel-affluence.ts (insertWheelOfUnimaginableAffluenceData)
+CREATE TABLE IF NOT EXISTS {db}.wheel_unimaginable_affluence (
+  player_id UInt32,
+  point Int64,
+  created_at DateTime
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (player_id, created_at)
+SETTINGS index_granularity = 8192;
+
+-- gge-tracker-his1 fork: Outer Realms live ranking (token-scrapper)
+-- Written by storeOuterRealmsEntries in the internal-scraping package.
+-- Distinct from the Postgres outer_realms_ranking, which keeps event history.
+CREATE TABLE IF NOT EXISTS {db}.outer_realms_ranking (
+  player_id UInt32,
+  player_name String,
+  server String,
+  score Int64,
+  rank UInt32,
+  level UInt16,
+  legendary_level UInt16,
+  might Int64,
+  castle_position_x Int32,
+  castle_position_y Int32,
+  fetch_date DateTime
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(fetch_date)
+ORDER BY (fetch_date, rank)
+SETTINGS index_granularity = 8192;
+
+-- gge-tracker-his1 fork: marker table for the last Outer Realms sweep
+CREATE TABLE IF NOT EXISTS {db}.latest_fetch_date (
+  fetch_date DateTime
+) ENGINE = MergeTree
+ORDER BY fetch_date
+SETTINGS index_granularity = 8192;
+
+"""
+
+CLICKHOUSE_GLOBAL_DB = r"""
+-- gge-tracker-his1 fork: shared global database (cross-server boards)
+-- Read by the backend for /events (live Outer Realms), /rift-raid, and the
+-- global ranking endpoints. For a single-server fork these are all HIS1.
+CREATE DATABASE IF NOT EXISTS ggetracker_global;
+
+CREATE TABLE IF NOT EXISTS ggetracker_global.outer_realms_ranking (
+  player_id UInt32,
+  player_name String,
+  server String,
+  score Int64,
+  rank UInt32,
+  level UInt16,
+  legendary_level UInt16,
+  might Int64,
+  castle_position_x Int32,
+  castle_position_y Int32,
+  fetch_date DateTime
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(fetch_date)
+ORDER BY (fetch_date, rank)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS ggetracker_global.latest_fetch_date (
+  fetch_date DateTime
+) ENGINE = MergeTree
+ORDER BY fetch_date
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS ggetracker_global.rift_raid_ranking (
+  server_id UInt32,
+  division_id UInt16,
+  subdivision_id UInt16,
+  alliance_id UInt32,
+  alliance_name String,
+  rank UInt32,
+  score String
+) ENGINE = MergeTree
+ORDER BY (division_id, subdivision_id, rank)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS ggetracker_global.rift_raid_hours (
+  event_id UInt32,
+  hour DateTime,
+  game String,
+  created_at DateTime DEFAULT now()
+) ENGINE = MergeTree
+ORDER BY (game, hour, event_id)
 SETTINGS index_granularity = 8192;
 
 """
@@ -183,6 +328,9 @@ def patch_clickhouse(path: Path) -> None:
 
     if 'CREATE DATABASE IF NOT EXISTS logs;' not in content:
         content += '\n' + CLICKHOUSE_LOGS_DB
+
+    if 'CREATE DATABASE IF NOT EXISTS ggetracker_global;' not in content:
+        content += '\n' + CLICKHOUSE_GLOBAL_DB
 
     path.write_text(content)
     print(f"[OK] Patched {path}")
