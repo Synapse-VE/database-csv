@@ -10,7 +10,7 @@ from pathlib import Path
 
 POSTGRES_PATCH = r"""
 --
--- ==== gge-tracker fork: schema drift fixes ====
+-- ==== gge-tracker-his1 fork: schema drift fixes ====
 -- Adds the columns and tables the backend/scraper code expects but the
 -- public database-csv does not ship. Idempotent so re-running the
 -- migration is safe.
@@ -224,6 +224,117 @@ WHERE p.castles IS NOT NULL
 CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
   ON public.global_ranking(id, region);
 
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
+
 """
 
 CLICKHOUSE_PER_DB_PATCH = r"""
@@ -362,6 +473,9 @@ SETTINGS index_granularity = 8192;
 """
 
 
+POSTGRES_MARKER = '-- ==== gge-tracker-his1 fork: schema drift fixes ===='
+
+
 def patch_postgres(path: Path) -> None:
     content = path.read_text()
     parts = re.split(r'(CREATE DATABASE "empire-ranking[^"]*";)', content)
@@ -373,7 +487,9 @@ def patch_postgres(path: Path) -> None:
         marker = parts[i]
         body = parts[i + 1] if i + 1 < len(parts) else ''
         new_parts.append(marker)
-        new_parts.append(body + POSTGRES_PATCH)
+        if POSTGRES_MARKER not in body:
+            body += POSTGRES_PATCH
+        new_parts.append(body)
 
     path.write_text(''.join(new_parts))
     print(f"[OK] Patched {path} ({len(parts)//2} DBs)")

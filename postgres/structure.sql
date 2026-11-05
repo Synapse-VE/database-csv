@@ -1041,6 +1041,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -1057,9 +1068,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -1069,6 +1083,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -1109,6 +1125,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-us1";
 \connect empire-ranking-us1;
@@ -1907,6 +2149,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -1923,9 +2176,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -1935,6 +2191,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -1975,6 +2233,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-cz1";
 \connect empire-ranking-cz1;
@@ -2773,6 +3257,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -2789,9 +3284,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -2801,6 +3299,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -2841,6 +3341,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-ro1";
 \connect empire-ranking-ro1;
@@ -3639,6 +4365,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -3655,9 +4392,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -3667,6 +4407,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -3707,6 +4449,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-nl1";
 \connect empire-ranking-nl1;
@@ -4505,6 +5473,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -4521,9 +5500,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -4533,6 +5515,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -4573,6 +5557,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-world1";
 \connect empire-ranking-world1;
@@ -5371,6 +6581,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -5387,9 +6608,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -5399,6 +6623,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -5439,6 +6665,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-int3";
 \connect empire-ranking-int3;
@@ -6237,6 +7689,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -6253,9 +7716,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -6265,6 +7731,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -6305,6 +7773,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-de1";
 \connect empire-ranking-de1;
@@ -7103,6 +8797,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -7119,9 +8824,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -7131,6 +8839,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -7171,6 +8881,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-tr1";
 \connect empire-ranking-tr1;
@@ -7980,6 +9916,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -7996,9 +9943,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -8008,6 +9958,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -8048,6 +10000,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-pt1";
 \connect empire-ranking-pt1;
@@ -8857,6 +11035,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -8873,9 +11062,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -8885,6 +11077,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -8925,6 +11119,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-br1";
 \connect empire-ranking-br1;
@@ -9734,6 +12154,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -9750,9 +12181,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -9762,6 +12196,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -9802,6 +12238,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-in1";
 \connect empire-ranking-in1;
@@ -10611,6 +13273,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -10627,9 +13300,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -10639,6 +13315,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -10679,6 +13357,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-it1";
 \connect empire-ranking-it1;
@@ -11488,6 +14392,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -11504,9 +14419,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -11516,6 +14434,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -11556,6 +14476,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-pl1";
 \connect empire-ranking-pl1;
@@ -12365,6 +15511,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -12381,9 +15538,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -12393,6 +15553,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -12433,6 +15595,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-au1";
 \connect empire-ranking-au1;
@@ -13231,6 +16619,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -13247,9 +16646,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -13259,6 +16661,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -13299,6 +16703,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-ar1";
 \connect empire-ranking-ar1;
@@ -14097,6 +17727,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -14113,9 +17754,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -14125,6 +17769,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -14165,6 +17811,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-hant1";
 \connect empire-ranking-hant1;
@@ -14963,6 +18835,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -14979,9 +18862,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -14991,6 +18877,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -15031,6 +18919,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-hu1";
 \connect empire-ranking-hu1;
@@ -15829,6 +19943,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -15845,9 +19970,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -15857,6 +19985,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -15897,6 +20027,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-hu2";
 \connect empire-ranking-hu2;
@@ -16695,6 +21051,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -16711,9 +21078,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -16723,6 +21093,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -16763,6 +21135,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-global";
 \connect empire-ranking-global;
@@ -17688,6 +22286,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -17704,9 +22313,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -17716,6 +22328,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -17756,6 +22370,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-es1";
 \connect empire-ranking-es1;
@@ -18554,6 +23394,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -18570,9 +23421,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -18582,6 +23436,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -18622,6 +23478,232 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
 CREATE DATABASE "empire-ranking-sa1";
 \connect empire-ranking-sa1;
@@ -19420,6 +24502,17 @@ ALTER TABLE public.alliances ADD COLUMN IF NOT EXISTS description text;
 
 ALTER TABLE public.players ADD COLUMN IF NOT EXISTS alliance_rank smallint;
 
+-- player_alliance_update: the scraper logs the alliance names alongside
+-- their ids, so the history rows carry both. The public schema only
+-- ships the ids.
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS old_alliance_name varchar(255);
+ALTER TABLE public.player_alliance_update ADD COLUMN IF NOT EXISTS new_alliance_name varchar(255);
+
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS global_available_at timestamptz DEFAULT NOW();
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS player_available_at timestamptz;
+ALTER TABLE public.dungeons ALTER COLUMN total_attack_count SET DEFAULT 0;
+ALTER TABLE public.dungeons ADD COLUMN IF NOT EXISTS attacked_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS public.alliance_description_history (
   id serial PRIMARY KEY,
   alliance_id integer NOT NULL REFERENCES public.alliances(id),
@@ -19436,9 +24529,12 @@ CREATE TABLE IF NOT EXISTS public.dungeons_history (
   position_x smallint NOT NULL,
   position_y smallint NOT NULL,
   player_id integer NOT NULL REFERENCES public.players(id),
+  attacked_at timestamptz DEFAULT NOW(),
   created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_attacked_at ON public.dungeons_history(attacked_at);
 CREATE INDEX IF NOT EXISTS idx_dungeons_history_created_at ON public.dungeons_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_dungeons_history_player_id ON public.dungeons_history(player_id);
 
 CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   kid smallint NOT NULL,
@@ -19448,6 +24544,8 @@ CREATE TABLE IF NOT EXISTS public.dungeon_player_cooldowns (
   available_at timestamptz NOT NULL,
   PRIMARY KEY (kid, position_x, position_y, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_dungeon_player_cooldowns_available_at
+  ON public.dungeon_player_cooldowns(available_at);
 
 CREATE TABLE IF NOT EXISTS public.storm_meta (
   id boolean PRIMARY KEY DEFAULT TRUE,
@@ -19488,4 +24586,230 @@ CREATE TABLE IF NOT EXISTS public.storm_isles (
 );
 CREATE INDEX IF NOT EXISTS idx_storm_isles_state ON public.storm_isles(state);
 CREATE INDEX IF NOT EXISTS idx_storm_isles_occupier ON public.storm_isles(occupier_id);
+
+--
+-- ==== Event history: Outer Realms + Beyond the Horizon ====
+-- Used by executeCustomEventHistory in the internal-scraping package.
+-- Two tables per event: a header (event_num, FR, IGH, top1) and a detail
+-- (one row per ranked player).
+--
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.outer_realms_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_event_num ON public.outer_realms_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_outer_realms_ranking_player_id ON public.outer_realms_ranking(player_id);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_event (
+  event_num INTEGER PRIMARY KEY,
+  collect_date TIMESTAMPTZ DEFAULT NOW(),
+  fr TEXT,
+  igh TEXT,
+  top1_player_id BIGINT,
+  top1_player_score BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS public.beyond_the_horizon_ranking (
+  id BIGSERIAL PRIMARY KEY,
+  event_num INTEGER NOT NULL,
+  player_id BIGINT,
+  server VARCHAR(20),
+  level INTEGER,
+  legendary_level INTEGER,
+  point BIGINT,
+  rank INTEGER,
+  player_name VARCHAR(255),
+  alliance_name VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_event_num ON public.beyond_the_horizon_ranking(event_num);
+CREATE INDEX IF NOT EXISTS idx_beyond_the_horizon_ranking_player_id ON public.beyond_the_horizon_ranking(player_id);
+
+--
+-- ==== Grand Tournament ====
+-- Used by the /grand-tournament endpoints in the backend, filled by
+-- fillGrandTournamentResults in the internal-scraping package.
+-- The raw table carries one row per (event, division, subdivision,
+-- alliance); the matview collapses them into hour buckets the API reads.
+--
+
+CREATE TABLE IF NOT EXISTS public.grand_tournament (
+  id BIGSERIAL PRIMARY KEY,
+  game VARCHAR(10) NOT NULL,
+  server_id INTEGER NOT NULL,
+  alliance_name VARCHAR(255) NOT NULL,
+  subdivision_id INTEGER NOT NULL,
+  division_id INTEGER NOT NULL,
+  alliance_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  rank INTEGER NOT NULL,
+  score BIGINT NOT NULL,
+  event_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_event
+  ON public.grand_tournament(event_id, division_id, subdivision_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_alliance
+  ON public.grand_tournament(alliance_id);
+CREATE INDEX IF NOT EXISTS idx_grand_tournament_window
+  ON public.grand_tournament(game, created_at);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.grand_tournament_hours_mv AS
+SELECT
+  event_id,
+  DATE_TRUNC('hour', created_at) AS hour,
+  game
+FROM public.grand_tournament
+GROUP BY event_id, DATE_TRUNC('hour', created_at), game
+ORDER BY event_id, hour;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grand_tournament_hours_mv_pk
+  ON public.grand_tournament_hours_mv(event_id, hour, game);
+
+--
+-- ==== Global ranking (materialized view) ====
+-- Read by /statistics/ranking/player/:id. The upstream builds it with
+-- map_global_ranking.sh from cross-server data; a single-server fork
+-- builds it from this DB's own players. The region literal below must
+-- match the <global-name> of the server in servers.xml.
+--
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.global_ranking AS
+SELECT
+  p.id,
+  'his1'::text AS region,
+  RANK() OVER (ORDER BY p.current_fame DESC) AS global_rank
+FROM public.players p
+WHERE p.castles IS NOT NULL
+  AND p.castles <> '[]';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_global_ranking_id_region
+  ON public.global_ranking(id, region);
+
+--
+-- ==== 26.11.02: storm availability, ruins, dungeon summary, global players, mini games ====
+--
+
+ALTER TABLE public.players ADD COLUMN IF NOT EXISTS is_ruin boolean NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.storm_forts
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.storm_isles
+  ADD COLUMN IF NOT EXISTS available_since_observed boolean NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_available_seconds integer;
+
+ALTER TABLE public.dungeons
+  ADD COLUMN IF NOT EXISTS attack_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS previous_attack_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_attacker_id integer;
+
+UPDATE public.dungeons
+SET attack_count = COALESCE(total_attack_count, 0)
+WHERE attack_count = 0 AND COALESCE(total_attack_count, 0) > 0;
+
+UPDATE public.dungeons d
+SET last_attack_at = h.last_at,
+    previous_attack_at = h.prev_at,
+    last_attacker_id = h.last_player
+FROM (
+  SELECT
+    kid, position_x, position_y,
+    MAX(attacked_at) AS last_at,
+    (ARRAY_AGG(attacked_at ORDER BY attacked_at DESC))[2] AS prev_at,
+    (ARRAY_AGG(player_id ORDER BY attacked_at DESC))[1] AS last_player
+  FROM public.dungeons_history
+  WHERE attacked_at IS NOT NULL
+  GROUP BY kid, position_x, position_y
+) h
+WHERE d.kid = h.kid AND d.position_x = h.position_x AND d.position_y = h.position_y;
+
+CREATE OR REPLACE FUNCTION public.dungeons_history_summary() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.dungeons d
+  SET previous_attack_at = d.last_attack_at,
+      last_attack_at = COALESCE(NEW.attacked_at, NOW()),
+      last_attacker_id = NEW.player_id,
+      attack_count = COALESCE(d.attack_count, 0) + 1,
+      total_attack_count = COALESCE(d.total_attack_count, 0) + 1
+  WHERE d.kid = NEW.kid AND d.position_x = NEW.position_x AND d.position_y = NEW.position_y;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dungeons_history_summary ON public.dungeons_history;
+CREATE TRIGGER trg_dungeons_history_summary
+  AFTER INSERT ON public.dungeons_history
+  FOR EACH ROW EXECUTE FUNCTION public.dungeons_history_summary();
+
+CREATE OR REPLACE VIEW public.global_players AS
+SELECT
+  'his1'::text AS region,
+  p.id,
+  p.name,
+  p.alliance_id,
+  a.name AS alliance_name,
+  p.alliance_rank,
+  p.level,
+  p.legendary_level,
+  p.might_current,
+  p.might_all_time,
+  p.loot_current,
+  p.loot_all_time,
+  p.current_fame,
+  p.highest_fame,
+  p.honor,
+  p.max_honor,
+  p.peace_disabled_at,
+  COALESCE(jsonb_array_length(p.castles) > 0, false) AS active
+FROM public.players p
+LEFT JOIN public.alliances a ON a.id = p.alliance_id;
+
+CREATE TABLE IF NOT EXISTS public.mini_games (
+  id serial PRIMARY KEY,
+  game_date date NOT NULL,
+  server varchar(20) NOT NULL,
+  player_id bigint,
+  castle_id bigint,
+  position_x integer,
+  position_y integer,
+  nb_castles integer,
+  skin_equipment_id bigint,
+  skin_equipment_name text,
+  gate_level integer,
+  wall_level integer,
+  keep_level integer,
+  tower_level integer,
+  castle_name text,
+  alliance_rank integer,
+  honor integer,
+  player_title_1 text,
+  player_title_2 text,
+  is_protection boolean DEFAULT false,
+  level integer,
+  legendary_level integer,
+  might bigint,
+  fame bigint,
+  name text,
+  created_at timestamptz NOT NULL DEFAULT NOW(),
+  UNIQUE (game_date, server)
+);
 
